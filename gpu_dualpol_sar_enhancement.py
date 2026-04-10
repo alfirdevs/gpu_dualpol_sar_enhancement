@@ -2,13 +2,20 @@
 """
 GPU-Accelerated Dual-Polarization SAR Enhancement and Saliency Mapping
 
-This script reads dual-polarization SAR images (VV and VH), performs GPU-accelerated
-preprocessing and feature fusion, builds a pseudo-RGB composite, computes a saliency
-map, and saves printable outputs including a PDF summary.
+This version avoids cupyx.scipy.ndimage because some CuPy/CUDA environments
+fail when JIT-compiling ndimage kernels with NVRTC.
 
-Primary target:
-- Ubuntu machine with NVIDIA GPU
-- CuPy-based GPU acceleration
+What still runs on GPU:
+- transfer to GPU
+- log scaling
+- percentile normalization
+- VV/VH fusion
+- saliency fusion
+- RGB composite generation
+
+What runs on CPU for robustness:
+- Gaussian smoothing (OpenCV)
+- box filtering / local mean (OpenCV)
 
 Outputs:
 - vv.png
@@ -23,21 +30,12 @@ Outputs:
 - report.pdf
 - timing_report.txt
 
-Usage examples:
-    python3 gpu_dualpol_sar_enhancement.py \
+Example:
+    python3 gpu_dualpol_sar_enhancement_fixed.py \
         --vv /path/to/VV.tif \
         --vh /path/to/VH.tif \
-        --outdir results
-
-    python3 gpu_dualpol_sar_enhancement.py \
-        --vv VV.tif --vh VH.tif --outdir results --benchmark-cpu
-
-Recommended installation on Ubuntu:
-    pip install numpy matplotlib opencv-python tifffile pillow scipy
-    pip install cupy-cuda12x
-
-Optional for GeoTIFF support:
-    pip install rasterio
+        --outdir results \
+        --benchmark-cpu
 """
 
 from __future__ import annotations
@@ -47,20 +45,20 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Dict, Optional, Tuple
 
-import numpy as np
 import cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+import numpy as np
 
 try:
     import tifffile
 except Exception as exc:
     print(f"ERROR: tifffile is required: {exc}", file=sys.stderr)
-    sys.exit(1)
+    raise SystemExit(1)
 
 try:
     import rasterio  # type: ignore
@@ -70,12 +68,10 @@ except Exception:
 
 try:
     import cupy as cp
-    import cupyx.scipy.ndimage as cnd
     HAS_CUPY = True
 except Exception:
     HAS_CUPY = False
     cp = None
-    cnd = None
 
 try:
     from scipy.ndimage import gaussian_filter as cpu_gaussian_filter
@@ -119,8 +115,7 @@ def parse_args() -> Config:
     parser.add_argument("--outdir", required=True, help="Output directory")
     parser.add_argument("--gaussian-sigma", type=float, default=1.2)
     parser.add_argument("--local-window", type=int, default=15)
-    parser.add_argument("--benchmark-cpu", action="store_true",
-                        help="Run a CPU benchmark path for timing comparison")
+    parser.add_argument("--benchmark-cpu", action="store_true")
     args = parser.parse_args()
 
     if args.local_window < 3 or args.local_window % 2 == 0:
@@ -167,11 +162,7 @@ def read_tiff(path: str) -> np.ndarray:
     if arr.ndim > 2:
         arr = arr[0]
 
-    if not np.issubdtype(arr.dtype, np.floating):
-        arr = arr.astype(np.float32)
-    else:
-        arr = arr.astype(np.float32, copy=False)
-
+    arr = arr.astype(np.float32, copy=False)
     arr[~np.isfinite(arr)] = 0.0
     arr[arr < 0] = 0.0
     return arr
@@ -203,13 +194,28 @@ def to_uint8_cpu(img01: np.ndarray) -> np.ndarray:
     return np.clip(img01 * 255.0, 0, 255).astype(np.uint8)
 
 
+def cpu_gaussian_blur_from_gpu(x_gpu: "cp.ndarray", sigma: float) -> "cp.ndarray":
+    x = cp.asnumpy(x_gpu).astype(np.float32)
+    ksize = max(3, int(2 * round(3 * sigma) + 1))
+    if ksize % 2 == 0:
+        ksize += 1
+    y = cv2.GaussianBlur(x, (ksize, ksize), sigmaX=sigma, sigmaY=sigma)
+    return cp.asarray(y, dtype=cp.float32)
+
+
+def cpu_box_filter_from_gpu(x_gpu: "cp.ndarray", ksize: int) -> "cp.ndarray":
+    x = cp.asnumpy(x_gpu).astype(np.float32)
+    y = cv2.blur(x, (ksize, ksize))
+    return cp.asarray(y, dtype=cp.float32)
+
+
 def gpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Tuple[Dict[str, np.ndarray], Timing]:
     if not HAS_CUPY:
-        raise RuntimeError("CuPy is not available. Install cupy-cuda12x or matching version for your CUDA stack.")
+        raise RuntimeError("CuPy is not available. Install a matching CuPy build, e.g. cupy-cuda12x.")
 
     timing = Timing()
-    t0 = time.perf_counter()
 
+    t0 = time.perf_counter()
     vv_gpu = cp.asarray(vv, dtype=cp.float32)
     vh_gpu = cp.asarray(vh, dtype=cp.float32)
     sync_gpu()
@@ -222,8 +228,8 @@ def gpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Tuple[Dict[st
     vv_norm = percentile_normalize_gpu(vv_log, 1.0, 99.0, cfg.eps)
     vh_norm = percentile_normalize_gpu(vh_log, 1.0, 99.0, cfg.eps)
 
-    vv_smooth = cnd.gaussian_filter(vv_norm, sigma=cfg.gaussian_sigma)
-    vh_smooth = cnd.gaussian_filter(vh_norm, sigma=cfg.gaussian_sigma)
+    vv_smooth = cpu_gaussian_blur_from_gpu(vv_norm, cfg.gaussian_sigma)
+    vh_smooth = cpu_gaussian_blur_from_gpu(vh_norm, cfg.gaussian_sigma)
     sync_gpu()
     timing.gpu_preprocess_s = time.perf_counter() - t1
 
@@ -233,12 +239,11 @@ def gpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Tuple[Dict[st
     norm_diff = (vv_smooth - vh_smooth) / (vv_smooth + vh_smooth + cfg.eps)
     norm_diff_shift = 0.5 * (norm_diff + 1.0)
 
-    local_mean = cnd.uniform_filter(sum_map, size=cfg.local_window)
-    local_sq_mean = cnd.uniform_filter(sum_map * sum_map, size=cfg.local_window)
+    local_mean = cpu_box_filter_from_gpu(sum_map, cfg.local_window)
+    local_sq_mean = cpu_box_filter_from_gpu(sum_map * sum_map, cfg.local_window)
     local_var = cp.maximum(local_sq_mean - local_mean * local_mean, 0.0)
     local_std = cp.sqrt(local_var + cfg.eps)
-    local_contrast = (sum_map - local_mean) / (local_std + cfg.eps)
-    local_contrast = cp.maximum(local_contrast, 0.0)
+    local_contrast = cp.maximum((sum_map - local_mean) / (local_std + cfg.eps), 0.0)
 
     sum_n = percentile_normalize_gpu(sum_map, 1.0, 99.0, cfg.eps)
     diff_n = percentile_normalize_gpu(diff_map, 1.0, 99.0, cfg.eps)
@@ -249,7 +254,7 @@ def gpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Tuple[Dict[st
 
     t3 = time.perf_counter()
     saliency = 0.34 * sum_n + 0.26 * diff_n + 0.18 * (1.0 - nd_n) + 0.22 * lc_n
-    saliency = cnd.gaussian_filter(saliency, sigma=1.0)
+    saliency = cpu_gaussian_blur_from_gpu(saliency, 1.0)
     saliency = percentile_normalize_gpu(
         saliency,
         cfg.saliency_percentile_clip_low,
@@ -283,13 +288,12 @@ def gpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Tuple[Dict[st
         timing.read_s + timing.gpu_preprocess_s + timing.gpu_features_s +
         timing.gpu_saliency_s + timing.gpu_post_s
     )
-
     return outputs, timing
 
 
 def cpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Dict[str, np.ndarray]:
     if not HAS_SCIPY:
-        raise RuntimeError("SciPy is required for CPU benchmark path. Install scipy.")
+        raise RuntimeError("SciPy is required for --benchmark-cpu. Install scipy or omit the flag.")
 
     vv_log = np.log1p(vv)
     vh_log = np.log1p(vh)
@@ -362,7 +366,7 @@ def save_direct_png(path: str, img: np.ndarray) -> None:
     elif img.ndim == 3:
         cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
     else:
-        raise ValueError(f"Unsupported shape: {img.shape}")
+        raise ValueError(f"Unsupported image shape: {img.shape}")
 
 
 def write_timing_report(path: str, timing: Timing, shape: Tuple[int, int]) -> None:
@@ -377,9 +381,8 @@ def write_timing_report(path: str, timing: Timing, shape: Tuple[int, int]) -> No
         f.write(f"GPU post/save-prep time: {timing.gpu_post_s:.4f} s\n")
         f.write(f"GPU total time: {timing.gpu_total_s:.4f} s\n")
         if timing.cpu_total_s is not None and timing.gpu_total_s > 0:
-            speedup = timing.cpu_total_s / timing.gpu_total_s
             f.write(f"CPU total time: {timing.cpu_total_s:.4f} s\n")
-            f.write(f"Speedup (CPU/GPU): {speedup:.2f}x\n")
+            f.write(f"Speedup (CPU/GPU): {timing.cpu_total_s / timing.gpu_total_s:.2f}x\n")
 
 
 def build_pdf_report(path: str, outputs: Dict[str, np.ndarray], overlay: np.ndarray,
@@ -387,20 +390,19 @@ def build_pdf_report(path: str, outputs: Dict[str, np.ndarray], overlay: np.ndar
     with PdfPages(path) as pdf:
         fig = plt.figure(figsize=(11, 8.5))
         plt.axis("off")
-        title = "GPU-Accelerated Dual-Pol SAR Enhancement Report"
-        subtitle = (
-            f"GPU total: {timing.gpu_total_s:.3f} s"
-            + (f" | CPU total: {timing.cpu_total_s:.3f} s" if timing.cpu_total_s is not None else "")
-        )
-        plt.text(0.5, 0.85, title, ha="center", va="center", fontsize=20, fontweight="bold")
+        plt.text(0.5, 0.85, "GPU-Accelerated Dual-Pol SAR Enhancement Report",
+                 ha="center", va="center", fontsize=20, fontweight="bold")
+        subtitle = f"GPU total: {timing.gpu_total_s:.3f} s"
+        if timing.cpu_total_s is not None:
+            subtitle += f" | CPU total: {timing.cpu_total_s:.3f} s"
         plt.text(0.5, 0.78, subtitle, ha="center", va="center", fontsize=12)
         plt.text(
             0.08,
             0.58,
             "This report summarizes dual-polarization SAR enhancement using VV and VH inputs.\n"
             "RGB = [VV, VH, |VV-VH|], and saliency is built from intensity, polarimetric contrast,\n"
-            "normalized difference, and local contrast. This is an enhancement and visualization\n"
-            "pipeline, not a final validated ship detector.",
+            "normalized difference, and local contrast. This output is an enhancement/saliency product,\n"
+            "not a final detection map.",
             fontsize=11,
             va="top",
         )
@@ -454,9 +456,12 @@ def main() -> int:
     timing.read_s = read_dt
 
     if cfg.benchmark_cpu:
-        cpu_t0 = time.perf_counter()
-        _ = cpu_preprocess(vv, vh, cfg)
-        timing.cpu_total_s = time.perf_counter() - cpu_t0
+        if not HAS_SCIPY:
+            print("Warning: SciPy not installed. Skipping CPU benchmark.")
+        else:
+            cpu_t0 = time.perf_counter()
+            _ = cpu_preprocess(vv, vh, cfg)
+            timing.cpu_total_s = time.perf_counter() - cpu_t0
 
     heatmap = make_heatmap(outputs["saliency"])
     overlay = make_overlay(outputs["vv"], heatmap, cfg.overlay_alpha)
