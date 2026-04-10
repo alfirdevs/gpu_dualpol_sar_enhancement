@@ -1,122 +1,128 @@
-# GPU Dual-Polarization SAR Enhancement Project
+content = """# 🚀 GPU Dual-Polarization SAR Enhancement Project
 
-This project provides a GPU-accelerated Python pipeline for enhancing and visualizing dual-polarization SAR imagery using VV and VH channels.
+This project provides a **GPU-accelerated Python pipeline** for enhancing and visualizing dual-polarization SAR imagery using **VV and VH channels**.
 
-It is designed for Ubuntu with an NVIDIA GPU and uses CuPy for acceleration.
+It is designed for **Ubuntu with an NVIDIA GPU** and uses **CuPy** for high-performance processing.
 
-## What it does
+---
+
+## 📌 What it does
 
 The pipeline:
-- reads a VV TIFF and a VH TIFF
-- applies log scaling and robust normalization
-- smooths both channels on the GPU
+
+- reads VV and VH TIFF SAR images  
+- applies log scaling + robust normalization  
+- performs GPU-based smoothing  
 - computes feature maps:
-  - VV + VH
-  - |VV - VH|
-  - normalized difference
-  - local contrast
-- builds a pseudo-RGB image using:
-  - R = VV
-  - G = VH
-  - B = |VV - VH|
-- computes a final saliency map
-- exports readable PNG files and a printable PDF report
-- optionally benchmarks CPU vs GPU
+  - VV + VH (intensity sum)  
+  - |VV − VH| (polarimetric contrast)  
+  - normalized difference  
+  - local contrast  
+  - anomaly map (NEW)  
+- builds a pseudo-RGB visualization:
+  - R = VV  
+  - G = VH  
+  - B = |VV − VH|  
+- computes a final saliency map  
+- exports readable PNGs + a printable PDF report  
+- optionally benchmarks CPU vs GPU performance  
 
-## Important scope note
+---
 
-This is an enhancement and saliency visualization pipeline.
-It is **not** a final validated ship detector.
+## ⭐ New Addition: Anomaly Map
 
-Because land can produce strong responses too, this version does **not** produce binary detections or boxes.
+A = max(0, S - blur(S))  
+where S = VV + VH
 
-## Project files
+This suppresses ocean clutter and enhances localized targets such as ships.
 
-- `gpu_dualpol_sar_enhancement.py` — main GPU script
-- `requirements.txt` — Python dependencies
-- `run_example.sh` — helper shell script
-- `README.md` — this file
+---
 
-## Outputs
+## 🧠 Method Summary
 
-The script saves:
-- `vv.png`
-- `vh.png`
-- `rgb_composite.png`
-- `sum_map.png`
-- `diff_map.png`
-- `norm_diff_map.png`
-- `saliency_map.png`
-- `saliency_heatmap.png`
-- `overlay.png`
-- `report.pdf`
-- `timing_report.txt`
+The final saliency map combines:
 
-## Installation on Ubuntu
+- VV + VH  
+- |VV − VH|  
+- normalized difference  
+- local contrast  
+- anomaly response  
+- VH contribution  
 
-Create and activate a virtual environment if you want:
+---
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
+## ⚠️ Important Scope Note
 
-Install base packages:
+This is an enhancement pipeline, not a final ship detector.
 
-```bash
-pip install -r requirements.txt
-```
+---
 
-Install CuPy matching your CUDA version. Example for CUDA 12:
+## 📂 Project Files
 
-```bash
-pip install cupy-cuda12x
-```
+- gpu_dualpol_sar_enhancement_updated.py  
+- requirements.txt  
+- run_example.sh  
+- README.md  
 
-Optional for some GeoTIFF files:
+---
 
-```bash
-pip install rasterio
-```
+## 📊 Outputs
 
-## Run
+Original:
+- vv_original.png  
+- vh_original.png  
 
-```bash
-python3 gpu_dualpol_sar_enhancement.py \
-  --vv /path/to/VV.tif \
-  --vh /path/to/VH.tif \
-  --outdir results
-```
+Feature maps:
+- sum_map.png  
+- diff_map.png  
+- norm_diff_map.png  
+- local_contrast.png  
+- anomaly_map.png  
 
-Optional CPU benchmark:
+Outputs:
+- rgb_composite.png  
+- saliency_map.png  
+- saliency_heatmap.png  
+- overlay.png  
 
-```bash
-python3 gpu_dualpol_sar_enhancement.py \
-  --vv /path/to/VV.tif \
-  --vh /path/to/VH.tif \
-  --outdir results \
-  --benchmark-cpu
-```
+Reports:
+- report.pdf  
+- timing_report.txt  
 
-## Example helper script
+---
 
-Edit `run_example.sh` and set your file paths, then run:
+## ⚙️ Installation
 
-```bash
-bash run_example.sh
-```
+python3 -m venv .venv  
+source .venv/bin/activate  
 
-## Printing on Ubuntu
+pip install -r requirements.txt  
+pip install cupy-cuda12x  
+pip install rasterio  
 
-Once the run completes, print the PDF report with:
+---
 
-```bash
-lp results/report.pdf
-```
+## ▶️ Run
 
-## Notes on input data
+python3 gpu_dualpol_sar_enhancement_updated.py \\
+  --vv /path/to/VV.tif \\
+  --vh /path/to/VH.tif \\
+  --outdir results  
 
-- VV and VH must have the same shape.
-- The code assumes one band per file.
-- For large Sentinel-1 scenes, pre-cropping to the area of interest is often helpful.
-- If you later want ship-oriented candidate extraction, the right next step is adding a water/land mask before thresholding.
+---
+
+## 🖨️ Print
+
+lp results/report.pdf  
+
+---
+
+## 📡 Notes
+
+- VV and VH must match in size  
+- One band per file  
+- Crop large scenes if needed  
+
+---
+
+
