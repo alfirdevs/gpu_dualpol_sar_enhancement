@@ -1,4 +1,4 @@
-content = """# 🚀 GPU Dual-Polarization SAR Enhancement Project
+# 🚀 GPU Dual-Polarization SAR Enhancement Project
 
 This project provides a **GPU-accelerated Python pipeline** for enhancing and visualizing dual-polarization SAR imagery using **VV and VH channels**.
 
