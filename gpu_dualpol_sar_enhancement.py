@@ -1,37 +1,15 @@
+
 #!/usr/bin/env python3
 """
 GPU-Accelerated Dual-Polarization SAR Enhancement and Saliency Mapping
+Updated version:
+- avoids cupyx.scipy.ndimage
+- adds anomaly/background-suppression enhancement
+- includes original VV/VH in the PDF report
+- saves printable outputs
 
-This version avoids cupyx.scipy.ndimage because some CuPy/CUDA environments
-fail when JIT-compiling ndimage kernels with NVRTC.
-
-What still runs on GPU:
-- transfer to GPU
-- log scaling
-- percentile normalization
-- VV/VH fusion
-- saliency fusion
-- RGB composite generation
-
-What runs on CPU for robustness:
-- Gaussian smoothing (OpenCV)
-- box filtering / local mean (OpenCV)
-
-Outputs:
-- vv.png
-- vh.png
-- rgb_composite.png
-- sum_map.png
-- diff_map.png
-- norm_diff_map.png
-- saliency_map.png
-- saliency_heatmap.png
-- overlay.png
-- report.pdf
-- timing_report.txt
-
-Example:
-    python3 gpu_dualpol_sar_enhancement_fixed.py \
+Usage:
+    python3 gpu_dualpol_sar_enhancement_updated.py \
         --vv /path/to/VV.tif \
         --vh /path/to/VH.tif \
         --outdir results \
@@ -45,20 +23,20 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple, Optional
 
+import numpy as np
 import cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-import numpy as np
 
 try:
     import tifffile
 except Exception as exc:
     print(f"ERROR: tifffile is required: {exc}", file=sys.stderr)
-    raise SystemExit(1)
+    sys.exit(1)
 
 try:
     import rasterio  # type: ignore
@@ -106,6 +84,7 @@ class Config:
     overlay_alpha: float = 0.38
     eps: float = 1e-6
     benchmark_cpu: bool = False
+    anomaly_window: int = 31
 
 
 def parse_args() -> Config:
@@ -115,11 +94,15 @@ def parse_args() -> Config:
     parser.add_argument("--outdir", required=True, help="Output directory")
     parser.add_argument("--gaussian-sigma", type=float, default=1.2)
     parser.add_argument("--local-window", type=int, default=15)
-    parser.add_argument("--benchmark-cpu", action="store_true")
+    parser.add_argument("--anomaly-window", type=int, default=31)
+    parser.add_argument("--benchmark-cpu", action="store_true",
+                        help="Run a CPU benchmark path for timing comparison")
     args = parser.parse_args()
 
     if args.local_window < 3 or args.local_window % 2 == 0:
         parser.error("--local-window must be an odd integer >= 3")
+    if args.anomaly_window < 3 or args.anomaly_window % 2 == 0:
+        parser.error("--anomaly-window must be an odd integer >= 3")
 
     return Config(
         vv_path=args.vv,
@@ -127,6 +110,7 @@ def parse_args() -> Config:
         outdir=args.outdir,
         gaussian_sigma=args.gaussian_sigma,
         local_window=args.local_window,
+        anomaly_window=args.anomaly_window,
         benchmark_cpu=args.benchmark_cpu,
     )
 
@@ -162,7 +146,11 @@ def read_tiff(path: str) -> np.ndarray:
     if arr.ndim > 2:
         arr = arr[0]
 
-    arr = arr.astype(np.float32, copy=False)
+    if not np.issubdtype(arr.dtype, np.floating):
+        arr = arr.astype(np.float32)
+    else:
+        arr = arr.astype(np.float32, copy=False)
+
     arr[~np.isfinite(arr)] = 0.0
     arr[arr < 0] = 0.0
     return arr
@@ -194,32 +182,38 @@ def to_uint8_cpu(img01: np.ndarray) -> np.ndarray:
     return np.clip(img01 * 255.0, 0, 255).astype(np.uint8)
 
 
-def cpu_gaussian_blur_from_gpu(x_gpu: "cp.ndarray", sigma: float) -> "cp.ndarray":
+def cpu_gaussian_blur_from_gpu(x_gpu, sigma: float):
     x = cp.asnumpy(x_gpu).astype(np.float32)
     ksize = max(3, int(2 * round(3 * sigma) + 1))
     if ksize % 2 == 0:
         ksize += 1
-    y = cv2.GaussianBlur(x, (ksize, ksize), sigmaX=sigma, sigmaY=sigma)
+    y = cv2.GaussianBlur(x, (ksize, ksize), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REFLECT)
     return cp.asarray(y, dtype=cp.float32)
 
 
-def cpu_box_filter_from_gpu(x_gpu: "cp.ndarray", ksize: int) -> "cp.ndarray":
+def cpu_box_filter_from_gpu(x_gpu, ksize: int):
     x = cp.asnumpy(x_gpu).astype(np.float32)
-    y = cv2.blur(x, (ksize, ksize))
+    y = cv2.blur(x, (ksize, ksize), borderType=cv2.BORDER_REFLECT)
     return cp.asarray(y, dtype=cp.float32)
 
 
-def gpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Tuple[Dict[str, np.ndarray], Timing]:
+def gpu_preprocess(vv_raw: np.ndarray, vh_raw: np.ndarray, cfg: Config) -> Tuple[Dict[str, np.ndarray], Timing]:
     if not HAS_CUPY:
-        raise RuntimeError("CuPy is not available. Install a matching CuPy build, e.g. cupy-cuda12x.")
+        raise RuntimeError("CuPy is not available. Install cupy-cuda12x or a version matching your CUDA setup.")
 
     timing = Timing()
 
     t0 = time.perf_counter()
-    vv_gpu = cp.asarray(vv, dtype=cp.float32)
-    vh_gpu = cp.asarray(vh, dtype=cp.float32)
+    vv_gpu = cp.asarray(vv_raw, dtype=cp.float32)
+    vh_gpu = cp.asarray(vh_raw, dtype=cp.float32)
     sync_gpu()
     timing.read_s = time.perf_counter() - t0
+
+    # Keep printable original versions
+    vv_orig_log = np.log1p(vv_raw)
+    vh_orig_log = np.log1p(vh_raw)
+    vv_orig_disp = percentile_normalize_cpu(vv_orig_log, 1.0, 99.0, cfg.eps)
+    vh_orig_disp = percentile_normalize_cpu(vh_orig_log, 1.0, 99.0, cfg.eps)
 
     t1 = time.perf_counter()
     vv_log = cp.log1p(vv_gpu)
@@ -245,15 +239,28 @@ def gpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Tuple[Dict[st
     local_std = cp.sqrt(local_var + cfg.eps)
     local_contrast = cp.maximum((sum_map - local_mean) / (local_std + cfg.eps), 0.0)
 
+    # New anomaly / background suppression map
+    bg_large = cpu_box_filter_from_gpu(sum_map, cfg.anomaly_window)
+    anomaly = cp.maximum(sum_map - bg_large, 0.0)
+
     sum_n = percentile_normalize_gpu(sum_map, 1.0, 99.0, cfg.eps)
     diff_n = percentile_normalize_gpu(diff_map, 1.0, 99.0, cfg.eps)
     nd_n = percentile_normalize_gpu(norm_diff_shift, 1.0, 99.0, cfg.eps)
     lc_n = percentile_normalize_gpu(local_contrast, 1.0, 99.0, cfg.eps)
+    anomaly_n = percentile_normalize_gpu(anomaly, 1.0, 99.0, cfg.eps)
+    vh_weight_n = percentile_normalize_gpu(vh_smooth, 1.0, 99.0, cfg.eps)
     sync_gpu()
     timing.gpu_features_s = time.perf_counter() - t2
 
     t3 = time.perf_counter()
-    saliency = 0.34 * sum_n + 0.26 * diff_n + 0.18 * (1.0 - nd_n) + 0.22 * lc_n
+    saliency = (
+        0.20 * sum_n +
+        0.16 * diff_n +
+        0.10 * (1.0 - nd_n) +
+        0.18 * lc_n +
+        0.26 * anomaly_n +
+        0.10 * vh_weight_n
+    )
     saliency = cpu_gaussian_blur_from_gpu(saliency, 1.0)
     saliency = percentile_normalize_gpu(
         saliency,
@@ -273,12 +280,15 @@ def gpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Tuple[Dict[st
     rgb = cp.clip(rgb, 0.0, 1.0)
 
     outputs = {
+        "vv_orig": vv_orig_disp,
+        "vh_orig": vh_orig_disp,
         "vv": cp.asnumpy(vv_smooth),
         "vh": cp.asnumpy(vh_smooth),
         "sum_map": cp.asnumpy(sum_n),
         "diff_map": cp.asnumpy(diff_n),
         "norm_diff_map": cp.asnumpy(nd_n),
         "local_contrast": cp.asnumpy(lc_n),
+        "anomaly_map": cp.asnumpy(anomaly_n),
         "saliency": cp.asnumpy(saliency),
         "rgb": cp.asnumpy(rgb),
     }
@@ -288,15 +298,21 @@ def gpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Tuple[Dict[st
         timing.read_s + timing.gpu_preprocess_s + timing.gpu_features_s +
         timing.gpu_saliency_s + timing.gpu_post_s
     )
+
     return outputs, timing
 
 
-def cpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Dict[str, np.ndarray]:
+def cpu_preprocess(vv_raw: np.ndarray, vh_raw: np.ndarray, cfg: Config) -> Dict[str, np.ndarray]:
     if not HAS_SCIPY:
-        raise RuntimeError("SciPy is required for --benchmark-cpu. Install scipy or omit the flag.")
+        raise RuntimeError("SciPy is required for CPU benchmark path. Install scipy.")
 
-    vv_log = np.log1p(vv)
-    vh_log = np.log1p(vh)
+    vv_orig_log = np.log1p(vv_raw)
+    vh_orig_log = np.log1p(vh_raw)
+    vv_orig_disp = percentile_normalize_cpu(vv_orig_log, 1.0, 99.0, cfg.eps)
+    vh_orig_disp = percentile_normalize_cpu(vh_orig_log, 1.0, 99.0, cfg.eps)
+
+    vv_log = np.log1p(vv_raw)
+    vh_log = np.log1p(vh_raw)
 
     vv_norm = percentile_normalize_cpu(vv_log, 1.0, 99.0, cfg.eps)
     vh_norm = percentile_normalize_cpu(vh_log, 1.0, 99.0, cfg.eps)
@@ -315,12 +331,24 @@ def cpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Dict[str, np.
     local_std = np.sqrt(local_var + cfg.eps)
     local_contrast = np.maximum((sum_map - local_mean) / (local_std + cfg.eps), 0.0)
 
+    bg_large = cpu_uniform_filter(sum_map, size=cfg.anomaly_window)
+    anomaly = np.maximum(sum_map - bg_large, 0.0)
+
     sum_n = percentile_normalize_cpu(sum_map, 1.0, 99.0, cfg.eps)
     diff_n = percentile_normalize_cpu(diff_map, 1.0, 99.0, cfg.eps)
     nd_n = percentile_normalize_cpu(norm_diff_shift, 1.0, 99.0, cfg.eps)
     lc_n = percentile_normalize_cpu(local_contrast, 1.0, 99.0, cfg.eps)
+    anomaly_n = percentile_normalize_cpu(anomaly, 1.0, 99.0, cfg.eps)
+    vh_weight_n = percentile_normalize_cpu(vh_smooth, 1.0, 99.0, cfg.eps)
 
-    saliency = 0.34 * sum_n + 0.26 * diff_n + 0.18 * (1.0 - nd_n) + 0.22 * lc_n
+    saliency = (
+        0.20 * sum_n +
+        0.16 * diff_n +
+        0.10 * (1.0 - nd_n) +
+        0.18 * lc_n +
+        0.26 * anomaly_n +
+        0.10 * vh_weight_n
+    )
     saliency = cpu_gaussian_filter(saliency, sigma=1.0)
     saliency = percentile_normalize_cpu(
         saliency,
@@ -337,12 +365,15 @@ def cpu_preprocess(vv: np.ndarray, vh: np.ndarray, cfg: Config) -> Dict[str, np.
     rgb = np.clip(rgb, 0.0, 1.0)
 
     return {
+        "vv_orig": vv_orig_disp.astype(np.float32),
+        "vh_orig": vh_orig_disp.astype(np.float32),
         "vv": vv_smooth.astype(np.float32),
         "vh": vh_smooth.astype(np.float32),
         "sum_map": sum_n.astype(np.float32),
         "diff_map": diff_n.astype(np.float32),
         "norm_diff_map": nd_n.astype(np.float32),
         "local_contrast": lc_n.astype(np.float32),
+        "anomaly_map": anomaly_n.astype(np.float32),
         "saliency": saliency.astype(np.float32),
         "rgb": rgb.astype(np.float32),
     }
@@ -366,7 +397,7 @@ def save_direct_png(path: str, img: np.ndarray) -> None:
     elif img.ndim == 3:
         cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
     else:
-        raise ValueError(f"Unsupported image shape: {img.shape}")
+        raise ValueError(f"Unsupported shape: {img.shape}")
 
 
 def write_timing_report(path: str, timing: Timing, shape: Tuple[int, int]) -> None:
@@ -381,8 +412,9 @@ def write_timing_report(path: str, timing: Timing, shape: Tuple[int, int]) -> No
         f.write(f"GPU post/save-prep time: {timing.gpu_post_s:.4f} s\n")
         f.write(f"GPU total time: {timing.gpu_total_s:.4f} s\n")
         if timing.cpu_total_s is not None and timing.gpu_total_s > 0:
+            speedup = timing.cpu_total_s / timing.gpu_total_s
             f.write(f"CPU total time: {timing.cpu_total_s:.4f} s\n")
-            f.write(f"Speedup (CPU/GPU): {timing.cpu_total_s / timing.gpu_total_s:.2f}x\n")
+            f.write(f"Speedup (CPU/GPU): {speedup:.2f}x\n")
 
 
 def build_pdf_report(path: str, outputs: Dict[str, np.ndarray], overlay: np.ndarray,
@@ -390,38 +422,45 @@ def build_pdf_report(path: str, outputs: Dict[str, np.ndarray], overlay: np.ndar
     with PdfPages(path) as pdf:
         fig = plt.figure(figsize=(11, 8.5))
         plt.axis("off")
-        plt.text(0.5, 0.85, "GPU-Accelerated Dual-Pol SAR Enhancement Report",
+        plt.text(0.5, 0.88, "GPU-Accelerated Dual-Pol SAR Enhancement Report",
                  ha="center", va="center", fontsize=20, fontweight="bold")
-        subtitle = f"GPU total: {timing.gpu_total_s:.3f} s"
-        if timing.cpu_total_s is not None:
-            subtitle += f" | CPU total: {timing.cpu_total_s:.3f} s"
-        plt.text(0.5, 0.78, subtitle, ha="center", va="center", fontsize=12)
+        subtitle = (
+            f"GPU total: {timing.gpu_total_s:.3f} s"
+            + (f" | CPU total: {timing.cpu_total_s:.3f} s" if timing.cpu_total_s is not None else "")
+        )
+        plt.text(0.5, 0.80, subtitle, ha="center", va="center", fontsize=12)
         plt.text(
-            0.08,
-            0.58,
-            "This report summarizes dual-polarization SAR enhancement using VV and VH inputs.\n"
-            "RGB = [VV, VH, |VV-VH|], and saliency is built from intensity, polarimetric contrast,\n"
-            "normalized difference, and local contrast. This output is an enhancement/saliency product,\n"
-            "not a final detection map.",
-            fontsize=11,
-            va="top",
+            0.08, 0.62,
+            "This report includes the original display-ready VV and VH images, processed dual-pol feature maps,\n"
+            "the anomaly/background-suppression map, and the final enhanced saliency image.\n"
+            "Final saliency combines total intensity, dual-pol contrast, normalized difference, local contrast,\n"
+            "a background-suppressed anomaly map, and a mild VH contribution.",
+            fontsize=11, va="top"
         )
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
         pages = [
-            [(outputs["vv"], "VV (processed)", "gray"),
-             (outputs["vh"], "VH (processed)", "gray"),
-             (outputs["rgb"], "RGB composite [VV, VH, |VV-VH|]", None)],
-            [(outputs["sum_map"], "Sum map", "gray"),
-             (outputs["diff_map"], "|VV-VH|", "gray"),
-             (outputs["norm_diff_map"], "Normalized difference", "gray")],
-            [(outputs["local_contrast"], "Local contrast", "gray"),
-             (outputs["saliency"], "Saliency map", "inferno"),
-             (heatmap, "Saliency heatmap", None)],
-            [(overlay, "Heatmap overlay on VV", None),
-             (outputs["rgb"], "RGB composite", None),
-             (outputs["saliency"], "Final saliency", "inferno")],
+            [
+                (outputs["vv_orig"], "Original VV (display-scaled)", "gray"),
+                (outputs["vh_orig"], "Original VH (display-scaled)", "gray"),
+                (outputs["rgb"], "RGB composite [VV, VH, |VV-VH|]", None),
+            ],
+            [
+                (outputs["sum_map"], "Sum map", "gray"),
+                (outputs["diff_map"], "|VV-VH|", "gray"),
+                (outputs["norm_diff_map"], "Normalized difference", "gray"),
+            ],
+            [
+                (outputs["local_contrast"], "Local contrast", "gray"),
+                (outputs["anomaly_map"], "Anomaly map", "gray"),
+                (outputs["saliency"], "Final enhanced saliency", "inferno"),
+            ],
+            [
+                (heatmap, "Saliency heatmap", None),
+                (overlay, "Heatmap overlay on processed VV", None),
+                (outputs["vv"], "Processed VV", "gray"),
+            ],
         ]
 
         for row in pages:
@@ -443,35 +482,36 @@ def main() -> int:
     ensure_dir(cfg.outdir)
 
     read_t0 = time.perf_counter()
-    vv = read_tiff(cfg.vv_path)
-    vh = read_tiff(cfg.vh_path)
+    vv_raw = read_tiff(cfg.vv_path)
+    vh_raw = read_tiff(cfg.vh_path)
     read_dt = time.perf_counter() - read_t0
 
-    if vv.shape != vh.shape:
-        raise ValueError(f"VV and VH shapes do not match: {vv.shape} vs {vh.shape}")
-    if vv.size == 0:
+    if vv_raw.shape != vh_raw.shape:
+        raise ValueError(f"VV and VH shapes do not match: {vv_raw.shape} vs {vh_raw.shape}")
+    if vv_raw.size == 0:
         raise ValueError("Input image is empty")
 
-    outputs, timing = gpu_preprocess(vv, vh, cfg)
+    outputs, timing = gpu_preprocess(vv_raw, vh_raw, cfg)
     timing.read_s = read_dt
 
     if cfg.benchmark_cpu:
-        if not HAS_SCIPY:
-            print("Warning: SciPy not installed. Skipping CPU benchmark.")
-        else:
-            cpu_t0 = time.perf_counter()
-            _ = cpu_preprocess(vv, vh, cfg)
-            timing.cpu_total_s = time.perf_counter() - cpu_t0
+        cpu_t0 = time.perf_counter()
+        _ = cpu_preprocess(vv_raw, vh_raw, cfg)
+        timing.cpu_total_s = time.perf_counter() - cpu_t0
 
     heatmap = make_heatmap(outputs["saliency"])
     overlay = make_overlay(outputs["vv"], heatmap, cfg.overlay_alpha)
 
+    save_direct_png(os.path.join(cfg.outdir, "vv_original.png"), to_uint8_cpu(outputs["vv_orig"]))
+    save_direct_png(os.path.join(cfg.outdir, "vh_original.png"), to_uint8_cpu(outputs["vh_orig"]))
     save_direct_png(os.path.join(cfg.outdir, "vv.png"), to_uint8_cpu(outputs["vv"]))
     save_direct_png(os.path.join(cfg.outdir, "vh.png"), to_uint8_cpu(outputs["vh"]))
     save_direct_png(os.path.join(cfg.outdir, "rgb_composite.png"), to_uint8_cpu(outputs["rgb"]))
     save_direct_png(os.path.join(cfg.outdir, "sum_map.png"), to_uint8_cpu(outputs["sum_map"]))
     save_direct_png(os.path.join(cfg.outdir, "diff_map.png"), to_uint8_cpu(outputs["diff_map"]))
     save_direct_png(os.path.join(cfg.outdir, "norm_diff_map.png"), to_uint8_cpu(outputs["norm_diff_map"]))
+    save_direct_png(os.path.join(cfg.outdir, "local_contrast.png"), to_uint8_cpu(outputs["local_contrast"]))
+    save_direct_png(os.path.join(cfg.outdir, "anomaly_map.png"), to_uint8_cpu(outputs["anomaly_map"]))
     save_direct_png(os.path.join(cfg.outdir, "saliency_map.png"), to_uint8_cpu(outputs["saliency"]))
     save_direct_png(os.path.join(cfg.outdir, "saliency_heatmap.png"), heatmap)
     save_direct_png(os.path.join(cfg.outdir, "overlay.png"), overlay)
@@ -495,7 +535,6 @@ def main() -> int:
     if timing.cpu_total_s is not None and timing.gpu_total_s > 0:
         print(f"CPU total time: {timing.cpu_total_s:.4f} s")
         print(f"Speedup: {timing.cpu_total_s / timing.gpu_total_s:.2f}x")
-
     return 0
 
 
