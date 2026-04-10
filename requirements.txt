@@ -1,0 +1,10 @@
+numpy
+matplotlib
+opencv-python
+tifffile
+pillow
+scipy
+# Install the CuPy package matching your CUDA version, for example:
+# cupy-cuda12x
+# Optional for some GeoTIFF files:
+# rasterio
