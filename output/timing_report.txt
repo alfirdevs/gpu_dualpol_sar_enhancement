@@ -1,0 +1,11 @@
+GPU Dual-Pol SAR Enhancement Timing Report
+================================================
+Image shape: 16672 x 26446
+Read time: 2.1800 s
+GPU preprocess time: 2.9314 s
+GPU features time: 4.5249 s
+GPU saliency time: 1.3134 s
+GPU post/save-prep time: 2.6352 s
+GPU total time: 14.4925 s
+CPU total time: 149.7713 s
+Speedup (CPU/GPU): 10.33x
